@@ -20,12 +20,21 @@ type command int
 const (
 	ping command = iota + 1
 	echo
+	set
+	get
 )
 
-var commands_map = map[string]command{
+const nullBulkString = "$-1\r\n"
+const simpleOK = "+OK\r\n"
+
+var commandsMap = map[string]command{
 	"PING": ping,
 	"ECHO": echo,
+	"SET":  set,
+	"GET":  get,
 }
+
+var userMap map[string]string = make(map[string]string)
 
 func main() {
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
@@ -55,7 +64,7 @@ func main() {
 					}
 				}
 
-				n, err = conn.Write(dispatch(parse_request(string(buf[:n]))))
+				n, err = conn.Write(dispatch(parseRequest(string(buf[:n]))))
 				if err != nil {
 					fmt.Println("Error writing response: ", err.Error())
 					os.Exit(1)
@@ -68,7 +77,7 @@ func main() {
 // This function could be defensive, double checking that every specified length matches the lenght,
 // and it could also be efficient by parsing only the lengths and manualy slicing the `r` string
 // instead of looking for CRLF. For now it is simple.
-func parse_request(r string) request {
+func parseRequest(r string) request {
 	tokens := strings.Split(r, "\r\n")
 	// TODO: check it starts with '*'. Handle Atoi error.
 	argc, _ := strconv.Atoi(tokens[0][1:])
@@ -90,7 +99,7 @@ func parse_request(r string) request {
 }
 
 func parse_command(s string) (command, bool) {
-	c, ok := commands_map[strings.ToUpper(s)]
+	c, ok := commandsMap[strings.ToUpper(s)]
 	return c, ok
 }
 
@@ -98,11 +107,29 @@ func dispatch(r request) []byte {
 	var response string
 	switch r.command {
 	case ping:
-		response = "+PONG\r\n"
+		response = toSimpleString("PONG")
 	case echo:
-		response = fmt.Sprintf("$%v\r\n%v\r\n", len(r.args[0]), r.args[0])
+		response = toBulkString(r.args[0])
+	case set:
+		userMap[r.args[0]] = r.args[1]
+		response = simpleOK
+	case get:
+		val, ok := userMap[r.args[0]]
+		if !ok {
+			response = nullBulkString
+		} else {
+			response = toBulkString(val)
+		}
 	default:
-		response = "+Command not found.\r\n"
+		response = toSimpleString("Command not supported.")
 	}
 	return []byte(response)
+}
+
+func toSimpleString(s string) string {
+	return fmt.Sprintf("+%v\r\n", s)
+}
+
+func toBulkString(s string) string {
+	return fmt.Sprintf("$%v\r\n%v\r\n", len(s), s)
 }
