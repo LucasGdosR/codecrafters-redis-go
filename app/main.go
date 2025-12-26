@@ -14,27 +14,34 @@ func main() {
 	}
 	defer l.Close()
 
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	buf := make([]byte, 4096)
 	for {
-		n, err := conn.Read(buf)
+		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error reading request: ", err.Error())
+			fmt.Println("Error accepting connection: ", err.Error())
 			os.Exit(1)
 		}
-		request := string(buf[:n])
-		_ = request
+		go func() {
+			defer conn.Close()
+			buf := make([]byte, 4096)
+			for {
+				n, err := conn.Read(buf)
+				if err != nil {
+					if err.Error() == "EOF" {
+						break
+					} else {
+						fmt.Println("Error reading request: ", err.Error())
+						os.Exit(1)
+					}
+				}
+				request := string(buf[:n])
+				_ = request
 
-		n, err = conn.Write([]byte("+PONG\r\n"))
-		if err != nil {
-			fmt.Println("Error writing response: ", err.Error())
-			os.Exit(1)
-		}
+				n, err = conn.Write([]byte("+PONG\r\n"))
+				if err != nil {
+					fmt.Println("Error writing response: ", err.Error())
+					os.Exit(1)
+				}
+			}
+		}()
 	}
 }
