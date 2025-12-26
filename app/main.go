@@ -7,27 +7,43 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/alphadose/haxmap"
 )
 
 //=============================================================================
 //	STRUCTS
 //=============================================================================
 
-type request struct {
+type request string
+
+type parsed_request struct {
 	// argc is redundant, as it is just len(args) - 1
 	argc uint64
 	command
 	args []string
 }
 
+type setStruct struct {
+	key, val string
+	expiry   int64
+	written  chan int
+}
+
+type rpushStruct struct {
+	args    []string
+	written chan int
+}
+
 type mapEntry struct {
 	val    string
 	expiry int64
 }
-type priorityQueueEntry mapEntry
+
+type priorityQueueEntry struct {
+	key    string
+	expiry int64
+}
 type priorityQueue []*priorityQueueEntry
 
 //=============================================================================
@@ -41,6 +57,7 @@ const (
 	echo
 	set
 	get
+	rpush
 )
 
 //=============================================================================
@@ -51,21 +68,31 @@ const nullBulkString = "$-1\r\n"
 const simpleOK = "+OK\r\n"
 
 var commandsMap = map[string]command{
-	"PING": ping,
-	"ECHO": echo,
-	"SET":  set,
-	"GET":  get,
+	"PING":  ping,
+	"ECHO":  echo,
+	"SET":   set,
+	"GET":   get,
+	"RPUSH": rpush,
 }
 
 //=============================================================================
 //	GLOBALS
 //=============================================================================
 
-// Concurrent hashmap.
-var userMap *haxmap.Map[string, mapEntry] = haxmap.New[string, mapEntry]()
+// MPSC channels for a single writer thread.
+// Unbuffered because of single consumer and the producer needing to wait for it.
+var stringChan chan setStruct = make(chan setStruct)
+var listChan chan rpushStruct = make(chan rpushStruct)
 
-// MPSC channel to perform expired record cleanup.
-var expirables chan string = make(chan string, 128)
+// Concurrent hashmaps.
+var stringMap = struct {
+	mu   sync.RWMutex
+	data map[string]mapEntry
+}{data: make(map[string]mapEntry)}
+var listMap = struct {
+	mu   sync.RWMutex
+	data map[string][]string
+}{data: make(map[string][]string)}
 
 //=============================================================================
 //	FUNCTIONS
@@ -79,7 +106,8 @@ func main() {
 	}
 	defer l.Close()
 
-	go expirationWorker()
+	go stringWriter()
+	go listWriter()
 
 	for {
 		conn, err := l.Accept()
@@ -89,6 +117,10 @@ func main() {
 		}
 		go func() {
 			defer conn.Close()
+			// Synchronize with writer thread before returning.
+			// Buffered so writer doesn't block.
+			written := make(chan int, 1)
+			defer close(written)
 			buf := make([]byte, 4096)
 			for {
 				n, err := conn.Read(buf)
@@ -100,8 +132,7 @@ func main() {
 						os.Exit(1)
 					}
 				}
-
-				n, err = conn.Write(dispatch(parseRequest(string(buf[:n]))))
+				n, err = conn.Write(request(buf[:n]).parse().dispatch(written))
 				if err != nil {
 					fmt.Println("Error writing response: ", err.Error())
 					os.Exit(1)
@@ -114,33 +145,28 @@ func main() {
 // This function could be defensive, double checking that every specified length matches the lenght,
 // and it could also be efficient by parsing only the lengths and manualy slicing the `r` string
 // instead of looking for CRLF. For now it is simple.
-func parseRequest(r string) request {
-	tokens := strings.Split(r, "\r\n")
+func (r request) parse() parsed_request {
+	tokens := strings.Split(string(r), "\r\n")
 	// TODO: check it starts with '*'. Handle ParseUint error.
 	argc, _ := strconv.ParseUint(tokens[0][1:], 10, 64)
 	if argc == 0 {
 		// TODO: return "empty request"
-		return request{}
+		return parsed_request{}
 	}
-	com, ok := parse_command(tokens[2])
+	com, ok := commandsMap[strings.ToUpper(tokens[2])]
 	if !ok {
 		fmt.Println("Error parsing command: command not found.")
 		// TODO: return "command not supported"
-		return request{}
+		return parsed_request{}
 	}
 	args := make([]string, 0, argc-1)
 	for i := 4; i < len(tokens); i += 2 {
 		args = append(args, tokens[i])
 	}
-	return request{argc: argc, command: com, args: args}
+	return parsed_request{argc: argc, command: com, args: args}
 }
 
-func parse_command(s string) (command, bool) {
-	c, ok := commandsMap[strings.ToUpper(s)]
-	return c, ok
-}
-
-func dispatch(r request) []byte {
+func (r parsed_request) dispatch(written chan int) []byte {
 	var response string
 	switch r.command {
 	case ping:
@@ -148,36 +174,39 @@ func dispatch(r request) []byte {
 	case echo:
 		response = toBulkString(r.args[0])
 	case set:
-		key := r.args[0]
-		var expiry int64
+		entry := setStruct{key: r.args[0], val: r.args[1], written: written}
 		if len(r.args) == 4 {
+			var multiplier time.Duration
 			switch strings.ToUpper(r.args[2]) {
 			case "EX":
-				// TODO: check bounds and error.
-				// TODO: check parsing error.
-				n, _ := strconv.ParseUint(r.args[3], 10, 64)
-				expiry = time.Now().Add(time.Duration(n) * time.Second).UnixMilli()
+				multiplier = time.Second
 			case "PX":
-				// TODO: check bounds and error.
-				// TODO: check parsing error.
-				n, _ := strconv.ParseUint(r.args[3], 10, 64)
-				expiry = time.Now().Add(time.Duration(n) * time.Millisecond).UnixMilli()
+				multiplier = time.Millisecond
 			default:
 				fmt.Println("Unsupported SET argument.")
 			}
+			// TODO: check parsing error.
+			n, _ := strconv.ParseUint(r.args[3], 10, 64)
+			entry.expiry = time.Now().Add(time.Duration(n) * multiplier).UnixMilli()
 		}
-		userMap.Set(key, mapEntry{r.args[1], expiry})
-		// Only send on the channel after it has been set.
-		if expiry != 0 {
-			expirables <- key
-		}
+		// Send job to writer thread.
+		stringChan <- entry
+		// Wait for acknowledgment.
+		<-written
 		response = simpleOK
 	case get:
-		if val, ok := userMap.Get(r.args[0]); ok && (val.expiry == 0 || time.Now().UnixMilli() < val.expiry) {
-			response = toBulkString(val.val)
+		stringMap.mu.RLock()
+		v, ok := stringMap.data[r.args[0]]
+		stringMap.mu.RUnlock()
+		if ok && (v.expiry == 0 || time.Now().UnixMilli() < v.expiry) {
+			response = toBulkString(v.val)
 		} else {
 			response = nullBulkString
 		}
+	case rpush:
+		listChan <- rpushStruct{args: r.args, written: written}
+		length := <-written
+		response = toRespInteger(length)
 	default:
 		response = toSimpleString("Command not supported.")
 	}
@@ -192,28 +221,34 @@ func toBulkString(s string) string {
 	return fmt.Sprintf("$%v\r\n%v\r\n", len(s), s)
 }
 
+func toRespInteger(i int) string {
+	return fmt.Sprintf(":%v\r\n", i)
+}
+
 // This background worker is the single consumer of `expirables`.
 // It has a priority queue with all records expiring in the future.
 // It waits for the next expiry time to arrive,
 // or a new expiry value to arrive in `expirables`.
-func expirationWorker() {
-	pq := &priorityQueue{}
-	heap.Init(pq)
+func stringWriter() {
+	expirables := &priorityQueue{}
+	heap.Init(expirables)
 
 	var timer *time.Timer
+	var nextExpired <-chan time.Time
 	for {
-		var nextExpired <-chan time.Time
-		for pq.Len() > 0 {
-			entry := (*pq)[0]
+		nextExpired = nil
+		for expirables.Len() > 0 {
+			entry := (*expirables)[0]
 			now := time.Now().UnixMilli()
 			d := time.Duration(entry.expiry-now) * time.Millisecond
 			if d <= 0 {
-				heap.Pop(pq)
-				// TODO: possibly remove from map.
-				val, ok := userMap.Get(entry.val)
-				if ok && val.expiry == entry.expiry {
-					// FIXME: race condition. Must use "CompareAndDel", but that doesn't exist.
-					userMap.Del(entry.val)
+				heap.Pop(expirables)
+				// Possibly remove from map.
+				v, ok := stringMap.data[entry.key]
+				if ok && v.expiry != 0 && v.expiry <= now {
+					stringMap.mu.Lock()
+					delete(stringMap.data, entry.key)
+					stringMap.mu.Unlock()
 				}
 			} else {
 				if timer == nil {
@@ -231,17 +266,29 @@ func expirationWorker() {
 				break
 			}
 		}
-
 		select {
-		case newEntry := <-expirables:
-			entry, ok := userMap.Get(newEntry)
-			// False if someone already overwrote it.
-			if ok {
-				heap.Push(pq, &priorityQueueEntry{newEntry, entry.expiry})
+		case job := <-stringChan:
+			if job.expiry != 0 {
+				heap.Push(expirables, &priorityQueueEntry{key: job.key, expiry: job.expiry})
 			}
+			stringMap.mu.Lock()
+			stringMap.data[job.key] = mapEntry{val: job.val, expiry: job.expiry}
+			stringMap.mu.Unlock()
+			job.written <- 0
 		case <-nextExpired:
 		}
+	}
+}
 
+func listWriter() {
+	for job := range listChan {
+		// We don't care about ok, because an empty slice is what we want for absent keys.
+		list, _ := listMap.data[job.args[0]]
+		listMap.mu.Lock()
+		list = append(list, job.args[1:]...)
+		listMap.data[job.args[0]] = list
+		listMap.mu.Unlock()
+		job.written <- len(list)
 	}
 }
 
