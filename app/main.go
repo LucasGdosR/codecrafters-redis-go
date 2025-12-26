@@ -22,17 +22,19 @@ func main() {
 	defer conn.Close()
 
 	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		fmt.Println("Error reading request: ", err.Error())
-		os.Exit(1)
-	}
-	request := string(buf[:n])
-	_ = request
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			fmt.Println("Error reading request: ", err.Error())
+			os.Exit(1)
+		}
+		request := string(buf[:n])
+		_ = request
 
-	n, err = conn.Write([]byte("+PONG\r\n"))
-	if err != nil {
-		fmt.Println("Error writing response: ", err.Error())
-		os.Exit(1)
+		n, err = conn.Write([]byte("+PONG\r\n"))
+		if err != nil {
+			fmt.Println("Error writing response: ", err.Error())
+			os.Exit(1)
+		}
 	}
 }
