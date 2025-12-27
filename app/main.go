@@ -58,6 +58,7 @@ const (
 	set
 	get
 	rpush
+	lrange
 )
 
 //=============================================================================
@@ -66,33 +67,36 @@ const (
 
 const nullBulkString = "$-1\r\n"
 const simpleOK = "+OK\r\n"
+const emptyArray = "*0\r\n"
 
 var commandsMap = map[string]command{
-	"PING":  ping,
-	"ECHO":  echo,
-	"SET":   set,
-	"GET":   get,
-	"RPUSH": rpush,
+	"PING":   ping,
+	"ECHO":   echo,
+	"SET":    set,
+	"GET":    get,
+	"RPUSH":  rpush,
+	"LRANGE": lrange,
 }
 
 //=============================================================================
 //	GLOBALS
 //=============================================================================
 
-// MPSC channels for a single writer thread.
-// Unbuffered because of single consumer and the producer needing to wait for it.
-var stringChan chan setStruct = make(chan setStruct)
-var listChan chan rpushStruct = make(chan rpushStruct)
-
-// Concurrent hashmaps.
-var stringMap = struct {
-	mu   sync.RWMutex
-	data map[string]mapEntry
-}{data: make(map[string]mapEntry)}
-var listMap = struct {
-	mu   sync.RWMutex
-	data map[string][]string
-}{data: make(map[string][]string)}
+var (
+	// MPSC channels for a single writer thread.
+	// Unbuffered because of single consumer and the producer needing to wait for it.
+	stringChan chan setStruct   = make(chan setStruct)
+	listChan   chan rpushStruct = make(chan rpushStruct)
+	// Concurrent hashmaps. Redis actually does not split these. Could be `any` val.
+	stringMap = struct {
+		mu   sync.RWMutex
+		data map[string]mapEntry
+	}{data: make(map[string]mapEntry)}
+	listMap = struct {
+		mu   sync.RWMutex
+		data map[string][]string
+	}{data: make(map[string][]string)}
+)
 
 //=============================================================================
 //	FUNCTIONS
@@ -106,6 +110,8 @@ func main() {
 	}
 	defer l.Close()
 
+	// Redis does not have a writer per type.
+	// Multi-key operations might require this to be rewritten.
 	go stringWriter()
 	go listWriter()
 
@@ -121,6 +127,7 @@ func main() {
 			// Buffered so writer doesn't block.
 			written := make(chan int, 1)
 			defer close(written)
+			// What if 4KB doesn't fit? Read in a loop.
 			buf := make([]byte, 4096)
 			for {
 				n, err := conn.Read(buf)
@@ -175,7 +182,7 @@ func (r parsed_request) dispatch(written chan int) []byte {
 		response = toBulkString(r.args[0])
 	case set:
 		entry := setStruct{key: r.args[0], val: r.args[1], written: written}
-		if len(r.args) == 4 {
+		if r.argc == 5 {
 			var multiplier time.Duration
 			switch strings.ToUpper(r.args[2]) {
 			case "EX":
@@ -206,7 +213,30 @@ func (r parsed_request) dispatch(written chan int) []byte {
 	case rpush:
 		listChan <- rpushStruct{args: r.args, written: written}
 		length := <-written
-		response = toRespInteger(length)
+		response = toRESPInteger(length)
+	case lrange:
+		if r.argc == 4 {
+			// TODO: handle parse error
+			start, _ := strconv.ParseInt(r.args[1], 10, 64)
+			// TODO: handle parse error
+			stop, _ := strconv.ParseInt(r.args[2], 10, 64)
+			stringMap.mu.RLock()
+			// Don't bother with OK, as empty list is what we want.
+			list, _ := listMap.data[r.args[0]]
+			if start < int64(len(list)) && start <= stop {
+				if stop >= int64(len(list)) {
+					stop = int64(len(list)) - 1
+				}
+				// Copy the slice contents so they cannot be modified while returning
+				result := make([]string, stop+1-start)
+				copy(result, list[start:stop+1])
+				stringMap.mu.RUnlock()
+				response = toRESPArray(result)
+			} else {
+				stringMap.mu.RUnlock()
+				response = emptyArray
+			}
+		} // TODO: handle error.
 	default:
 		response = toSimpleString("Command not supported.")
 	}
@@ -221,8 +251,17 @@ func toBulkString(s string) string {
 	return fmt.Sprintf("$%v\r\n%v\r\n", len(s), s)
 }
 
-func toRespInteger(i int) string {
+func toRESPInteger(i int) string {
 	return fmt.Sprintf(":%v\r\n", i)
+}
+
+func toRESPArray(ss []string) string {
+	response := make([]string, 0, len(ss)+1)
+	response = append(response, fmt.Sprintf("*%v\r\n", len(ss)))
+	for _, s := range ss {
+		response = append(response, fmt.Sprintf("$%v\r\n%v\r\n", len(s), s))
+	}
+	return strings.Join(response, "")
 }
 
 // This background worker is the single consumer of `expirables`.
