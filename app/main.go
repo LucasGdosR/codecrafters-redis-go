@@ -24,13 +24,14 @@ type parsed_request struct {
 	args []string
 }
 
-type setStruct struct {
+type setJob struct {
 	key, val string
 	expiry   int64
 	written  chan int
 }
 
-type rpushStruct struct {
+type listJob struct {
+	op      command
 	args    []string
 	written chan int
 }
@@ -57,8 +58,9 @@ const (
 	echo
 	set
 	get
-	rpush
 	lrange
+	rpush
+	lpush
 )
 
 //=============================================================================
@@ -76,6 +78,7 @@ var commandsMap = map[string]command{
 	"GET":    get,
 	"RPUSH":  rpush,
 	"LRANGE": lrange,
+	"LPUSH":  lpush,
 }
 
 //=============================================================================
@@ -85,8 +88,8 @@ var commandsMap = map[string]command{
 var (
 	// MPSC channels for a single writer thread.
 	// Unbuffered because of single consumer and the producer needing to wait for it.
-	stringChan chan setStruct   = make(chan setStruct)
-	listChan   chan rpushStruct = make(chan rpushStruct)
+	stringChan chan setJob  = make(chan setJob)
+	listChan   chan listJob = make(chan listJob)
 	// Concurrent hashmaps. Redis actually does not split these. Could be `any` val.
 	stringMap = struct {
 		mu   sync.RWMutex
@@ -94,8 +97,8 @@ var (
 	}{data: make(map[string]mapEntry)}
 	listMap = struct {
 		mu   sync.RWMutex
-		data map[string][]string
-	}{data: make(map[string][]string)}
+		data map[string]*Deque[string]
+	}{data: make(map[string]*Deque[string])}
 )
 
 //=============================================================================
@@ -181,7 +184,7 @@ func (r parsed_request) dispatch(written chan int) []byte {
 	case echo:
 		response = toBulkString(r.args[0])
 	case set:
-		entry := setStruct{key: r.args[0], val: r.args[1], written: written}
+		entry := setJob{key: r.args[0], val: r.args[1], written: written}
 		if r.argc == 5 {
 			var multiplier time.Duration
 			switch strings.ToUpper(r.args[2]) {
@@ -210,10 +213,6 @@ func (r parsed_request) dispatch(written chan int) []byte {
 		} else {
 			response = nullBulkString
 		}
-	case rpush:
-		listChan <- rpushStruct{args: r.args, written: written}
-		length := <-written
-		response = toRESPInteger(length)
 	case lrange:
 		if r.argc == 4 {
 			// TODO: handle parse error
@@ -221,19 +220,22 @@ func (r parsed_request) dispatch(written chan int) []byte {
 			// TODO: handle parse error
 			stop, _ := strconv.ParseInt(r.args[2], 10, 64)
 			stringMap.mu.RLock()
-			// Don't bother with OK, as empty list is what we want.
-			list, _ := listMap.data[r.args[0]]
+			list, ok := listMap.data[r.args[0]]
+			if !ok {
+				response = emptyArray
+				break
+			}
+			L := int64(list.Len())
 			if start < 0 {
-				start = max(int64(len(list))+start, 0)
+				start = max(L+start, 0)
 			}
 			if stop < 0 {
-				stop = max(int64(len(list))+stop, 0)
+				stop = max(L+stop, 0)
 			}
-			if start < int64(len(list)) && start <= stop {
-				stop = min(stop, int64(len(list))-1)
+			if start < L && start <= stop {
+				stop = min(stop, L-1)
 				// Copy the slice contents so they cannot be modified while returning
-				result := make([]string, stop+1-start)
-				copy(result, list[start:stop+1])
+				result, _ := list.SliceCopy(uint64(start), uint64(stop+1))
 				stringMap.mu.RUnlock()
 				response = toRESPArray(result)
 			} else {
@@ -241,6 +243,10 @@ func (r parsed_request) dispatch(written chan int) []byte {
 				response = emptyArray
 			}
 		} // TODO: handle error.
+	case rpush, lpush:
+		listChan <- listJob{op: r.command, args: r.args, written: written}
+		length := <-written
+		response = toRESPInteger(length)
 	default:
 		response = toSimpleString("Command not supported.")
 	}
@@ -325,13 +331,24 @@ func stringWriter() {
 
 func listWriter() {
 	for job := range listChan {
-		// We don't care about ok, because an empty slice is what we want for absent keys.
-		list, _ := listMap.data[job.args[0]]
+		list, ok := listMap.data[job.args[0]]
+		if !ok {
+			// Init list.
+			list = MakeDeque[string](1)
+			listMap.mu.Lock()
+			listMap.data[job.args[0]] = list
+			listMap.mu.Unlock()
+		}
 		listMap.mu.Lock()
-		list = append(list, job.args[1:]...)
-		listMap.data[job.args[0]] = list
+		switch job.op {
+		case rpush:
+			list.PushBack(job.args[1:]...)
+		case lpush:
+			list.PushFront(job.args[1:]...)
+		}
+		// No need to store the list back, as it is a pointer.
 		listMap.mu.Unlock()
-		job.written <- len(list)
+		job.written <- int(list.Len())
 	}
 }
 
