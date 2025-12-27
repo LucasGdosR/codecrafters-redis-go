@@ -223,10 +223,14 @@ func (r parsed_request) dispatch(written chan int) []byte {
 			stringMap.mu.RLock()
 			// Don't bother with OK, as empty list is what we want.
 			list, _ := listMap.data[r.args[0]]
+			if start < 0 {
+				start = max(int64(len(list))+start, 0)
+			}
+			if stop < 0 {
+				stop = max(int64(len(list))+stop, 0)
+			}
 			if start < int64(len(list)) && start <= stop {
-				if stop >= int64(len(list)) {
-					stop = int64(len(list)) - 1
-				}
+				stop = min(stop, int64(len(list))-1)
 				// Copy the slice contents so they cannot be modified while returning
 				result := make([]string, stop+1-start)
 				copy(result, list[start:stop+1])
