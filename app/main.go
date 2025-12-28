@@ -59,6 +59,7 @@ const (
 	set
 	get
 	lrange
+	llen
 	rpush
 	lpush
 )
@@ -79,6 +80,7 @@ var commandsMap = map[string]command{
 	"RPUSH":  rpush,
 	"LRANGE": lrange,
 	"LPUSH":  lpush,
+	"LLEN":   llen,
 }
 
 //=============================================================================
@@ -243,6 +245,15 @@ func (r parsed_request) dispatch(written chan int) []byte {
 				response = emptyArray
 			}
 		} // TODO: handle error.
+	case llen:
+		listMap.mu.RLock()
+		list, ok := listMap.data[r.args[0]]
+		listMap.mu.RUnlock()
+		if ok {
+			response = toRESPInteger(int(list.Len()))
+		} else {
+			response = toRESPInteger(0)
+		}
 	case rpush, lpush:
 		listChan <- listJob{op: r.command, args: r.args, written: written}
 		length := <-written
