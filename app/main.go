@@ -1,14 +1,12 @@
 package main
 
 import (
-	"container/heap"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 //=============================================================================
@@ -27,13 +25,13 @@ type parsed_request struct {
 type setJob struct {
 	key, val string
 	expiry   int64
-	written  chan int
+	written  chan []string
 }
 
 type listJob struct {
 	op      command
 	args    []string
-	written chan int
+	written chan []string
 }
 
 type mapEntry struct {
@@ -62,6 +60,7 @@ const (
 	llen
 	rpush
 	lpush
+	lpop
 )
 
 //=============================================================================
@@ -81,6 +80,19 @@ var commandsMap = map[string]command{
 	"LRANGE": lrange,
 	"LPUSH":  lpush,
 	"LLEN":   llen,
+	"LPOP":   lpop,
+}
+
+var dispatchTable = [...]func(parsed_request, chan []string) string{
+	ping:   pingFunc,
+	echo:   echoFunc,
+	set:    setFunc,
+	get:    getFunc,
+	lrange: lrangeFunc,
+	llen:   llenFunc,
+	rpush:  rpushFunc,
+	lpush:  lpushFunc,
+	lpop:   lpopFunc,
 }
 
 //=============================================================================
@@ -130,7 +142,7 @@ func main() {
 			defer conn.Close()
 			// Synchronize with writer thread before returning.
 			// Buffered so writer doesn't block.
-			written := make(chan int, 1)
+			written := make(chan []string, 1)
 			defer close(written)
 			// What if 4KB doesn't fit? Read in a loop.
 			buf := make([]byte, 4096)
@@ -178,90 +190,8 @@ func (r request) parse() parsed_request {
 	return parsed_request{argc: argc, command: com, args: args}
 }
 
-func (r parsed_request) dispatch(written chan int) []byte {
-	var response string
-	switch r.command {
-	case ping:
-		response = toSimpleString("PONG")
-	case echo:
-		response = toBulkString(r.args[0])
-	case set:
-		entry := setJob{key: r.args[0], val: r.args[1], written: written}
-		if r.argc == 5 {
-			var multiplier time.Duration
-			switch strings.ToUpper(r.args[2]) {
-			case "EX":
-				multiplier = time.Second
-			case "PX":
-				multiplier = time.Millisecond
-			default:
-				fmt.Println("Unsupported SET argument.")
-			}
-			// TODO: check parsing error.
-			n, _ := strconv.ParseUint(r.args[3], 10, 64)
-			entry.expiry = time.Now().Add(time.Duration(n) * multiplier).UnixMilli()
-		}
-		// Send job to writer thread.
-		stringChan <- entry
-		// Wait for acknowledgment.
-		<-written
-		response = simpleOK
-	case get:
-		stringMap.mu.RLock()
-		v, ok := stringMap.data[r.args[0]]
-		stringMap.mu.RUnlock()
-		if ok && (v.expiry == 0 || time.Now().UnixMilli() < v.expiry) {
-			response = toBulkString(v.val)
-		} else {
-			response = nullBulkString
-		}
-	case lrange:
-		if r.argc == 4 {
-			// TODO: handle parse error
-			start, _ := strconv.ParseInt(r.args[1], 10, 64)
-			// TODO: handle parse error
-			stop, _ := strconv.ParseInt(r.args[2], 10, 64)
-			stringMap.mu.RLock()
-			list, ok := listMap.data[r.args[0]]
-			if !ok {
-				response = emptyArray
-				break
-			}
-			L := int64(list.Len())
-			if start < 0 {
-				start = max(L+start, 0)
-			}
-			if stop < 0 {
-				stop = max(L+stop, 0)
-			}
-			if start < L && start <= stop {
-				stop = min(stop, L-1)
-				// Copy the slice contents so they cannot be modified while returning
-				result, _ := list.SliceCopy(uint64(start), uint64(stop+1))
-				stringMap.mu.RUnlock()
-				response = toRESPArray(result)
-			} else {
-				stringMap.mu.RUnlock()
-				response = emptyArray
-			}
-		} // TODO: handle error.
-	case llen:
-		listMap.mu.RLock()
-		list, ok := listMap.data[r.args[0]]
-		listMap.mu.RUnlock()
-		if ok {
-			response = toRESPInteger(int(list.Len()))
-		} else {
-			response = toRESPInteger(0)
-		}
-	case rpush, lpush:
-		listChan <- listJob{op: r.command, args: r.args, written: written}
-		length := <-written
-		response = toRESPInteger(length)
-	default:
-		response = toSimpleString("Command not supported.")
-	}
-	return []byte(response)
+func (r parsed_request) dispatch(written chan []string) []byte {
+	return []byte(dispatchTable[r.command](r, written))
 }
 
 func toSimpleString(s string) string {
@@ -283,95 +213,4 @@ func toRESPArray(ss []string) string {
 		response = append(response, fmt.Sprintf("$%v\r\n%v\r\n", len(s), s))
 	}
 	return strings.Join(response, "")
-}
-
-// This background worker is the single consumer of `expirables`.
-// It has a priority queue with all records expiring in the future.
-// It waits for the next expiry time to arrive,
-// or a new expiry value to arrive in `expirables`.
-func stringWriter() {
-	expirables := &priorityQueue{}
-	heap.Init(expirables)
-
-	var timer *time.Timer
-	var nextExpired <-chan time.Time
-	for {
-		nextExpired = nil
-		for expirables.Len() > 0 {
-			entry := (*expirables)[0]
-			now := time.Now().UnixMilli()
-			d := time.Duration(entry.expiry-now) * time.Millisecond
-			if d <= 0 {
-				heap.Pop(expirables)
-				// Possibly remove from map.
-				v, ok := stringMap.data[entry.key]
-				if ok && v.expiry != 0 && v.expiry <= now {
-					stringMap.mu.Lock()
-					delete(stringMap.data, entry.key)
-					stringMap.mu.Unlock()
-				}
-			} else {
-				if timer == nil {
-					timer = time.NewTimer(d)
-				} else {
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					timer.Reset(d)
-				}
-				nextExpired = timer.C
-				break
-			}
-		}
-		select {
-		case job := <-stringChan:
-			if job.expiry != 0 {
-				heap.Push(expirables, &priorityQueueEntry{key: job.key, expiry: job.expiry})
-			}
-			stringMap.mu.Lock()
-			stringMap.data[job.key] = mapEntry{val: job.val, expiry: job.expiry}
-			stringMap.mu.Unlock()
-			job.written <- 0
-		case <-nextExpired:
-		}
-	}
-}
-
-func listWriter() {
-	for job := range listChan {
-		list, ok := listMap.data[job.args[0]]
-		if !ok {
-			// Init list.
-			list = MakeDeque[string](1)
-			listMap.mu.Lock()
-			listMap.data[job.args[0]] = list
-			listMap.mu.Unlock()
-		}
-		listMap.mu.Lock()
-		switch job.op {
-		case rpush:
-			list.PushBack(job.args[1:]...)
-		case lpush:
-			list.PushFront(job.args[1:]...)
-		}
-		// No need to store the list back, as it is a pointer.
-		listMap.mu.Unlock()
-		job.written <- int(list.Len())
-	}
-}
-
-func (pq priorityQueue) Len() int           { return len(pq) }
-func (pq priorityQueue) Less(i, j int) bool { return pq[i].expiry < pq[j].expiry }
-func (pq priorityQueue) Swap(i, j int)      { pq[i], pq[j] = pq[j], pq[i] }
-func (pq *priorityQueue) Push(x any)        { *pq = append(*pq, x.(*priorityQueueEntry)) }
-func (pq *priorityQueue) Pop() any {
-	old := *pq
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil
-	*pq = old[0 : n-1]
-	return item
 }
