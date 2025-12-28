@@ -14,7 +14,6 @@ import (
 //=============================================================================
 
 type request string
-
 type parsed_request struct {
 	// argc is redundant, as it is just len(args) - 1
 	argc uint64
@@ -22,28 +21,22 @@ type parsed_request struct {
 	args []string
 }
 
-type setJob struct {
-	key, val string
-	expiry   int64
-	written  chan []string
+type sharedState struct {
+	// MPSC channels for single writer threads. Redis collapses these into one.
+	stringChan chan setJob
+	listChan   chan listJob
+	// Concurrent hashmaps. Redis actually does not split these. Could be `any` val.
+	stringMap concurrentMap[stringMapEntry]
+	listMap   concurrentMap[*Deque[string]]
 }
-
-type listJob struct {
-	op      command
-	args    []string
-	written chan []string
+type concurrentMap[T any] struct {
+	mu   sync.RWMutex
+	data map[string]T
 }
-
-type mapEntry struct {
+type stringMapEntry struct {
 	val    string
 	expiry int64
 }
-
-type priorityQueueEntry struct {
-	key    string
-	expiry int64
-}
-type priorityQueue []*priorityQueueEntry
 
 //=============================================================================
 //	ENUMS
@@ -61,15 +54,8 @@ const (
 	rpush
 	lpush
 	lpop
+	blpop
 )
-
-//=============================================================================
-//	CONSTANTS
-//=============================================================================
-
-const nullBulkString = "$-1\r\n"
-const simpleOK = "+OK\r\n"
-const emptyArray = "*0\r\n"
 
 var commandsMap = map[string]command{
 	"PING":   ping,
@@ -82,8 +68,7 @@ var commandsMap = map[string]command{
 	"LLEN":   llen,
 	"LPOP":   lpop,
 }
-
-var dispatchTable = [...]func(parsed_request, chan []string) string{
+var dispatchTable = [...]func(*sharedState, parsed_request, chan []string) string{
 	ping:   pingFunc,
 	echo:   echoFunc,
 	set:    setFunc,
@@ -93,27 +78,8 @@ var dispatchTable = [...]func(parsed_request, chan []string) string{
 	rpush:  rpushFunc,
 	lpush:  lpushFunc,
 	lpop:   lpopFunc,
+	blpop:  blpopFunc,
 }
-
-//=============================================================================
-//	GLOBALS
-//=============================================================================
-
-var (
-	// MPSC channels for a single writer thread.
-	// Unbuffered because of single consumer and the producer needing to wait for it.
-	stringChan chan setJob  = make(chan setJob)
-	listChan   chan listJob = make(chan listJob)
-	// Concurrent hashmaps. Redis actually does not split these. Could be `any` val.
-	stringMap = struct {
-		mu   sync.RWMutex
-		data map[string]mapEntry
-	}{data: make(map[string]mapEntry)}
-	listMap = struct {
-		mu   sync.RWMutex
-		data map[string]*Deque[string]
-	}{data: make(map[string]*Deque[string])}
-)
 
 //=============================================================================
 //	FUNCTIONS
@@ -127,10 +93,19 @@ func main() {
 	}
 	defer l.Close()
 
+	state := &sharedState{
+		// Unbuffered because of single consumer and the producer needing to wait for it.
+		make(chan setJob),
+		make(chan listJob),
+		// Concurrent hashmaps. Redis actually does not split these. Could be `any` val.
+		concurrentMap[stringMapEntry]{data: make(map[string]stringMapEntry)},
+		concurrentMap[*Deque[string]]{data: make(map[string]*Deque[string])},
+	}
+
 	// Redis does not have a writer per type.
 	// Multi-key operations might require this to be rewritten.
-	go stringWriter()
-	go listWriter()
+	go stringWriter(state)
+	go listWriter(state)
 
 	for {
 		conn, err := l.Accept()
@@ -156,7 +131,7 @@ func main() {
 						os.Exit(1)
 					}
 				}
-				n, err = conn.Write(request(buf[:n]).parse().dispatch(written))
+				n, err = conn.Write(request(buf[:n]).parse().dispatch(state, written))
 				if err != nil {
 					fmt.Println("Error writing response: ", err.Error())
 					os.Exit(1)
@@ -190,27 +165,6 @@ func (r request) parse() parsed_request {
 	return parsed_request{argc: argc, command: com, args: args}
 }
 
-func (r parsed_request) dispatch(written chan []string) []byte {
-	return []byte(dispatchTable[r.command](r, written))
-}
-
-func toSimpleString(s string) string {
-	return fmt.Sprintf("+%v\r\n", s)
-}
-
-func toBulkString(s string) string {
-	return fmt.Sprintf("$%v\r\n%v\r\n", len(s), s)
-}
-
-func toRESPInteger(i int) string {
-	return fmt.Sprintf(":%v\r\n", i)
-}
-
-func toRESPArray(ss []string) string {
-	response := make([]string, 0, len(ss)+1)
-	response = append(response, fmt.Sprintf("*%v\r\n", len(ss)))
-	for _, s := range ss {
-		response = append(response, fmt.Sprintf("$%v\r\n%v\r\n", len(s), s))
-	}
-	return strings.Join(response, "")
+func (r parsed_request) dispatch(state *sharedState, written chan []string) []byte {
+	return []byte(dispatchTable[r.command](state, r, written))
 }
