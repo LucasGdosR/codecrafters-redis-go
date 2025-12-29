@@ -1,33 +1,35 @@
-[![progress-banner](https://backend.codecrafters.io/progress/redis/5da9c059-2fd2-4ebf-bf9f-37998b0a97e0)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# Toy Redis in Go
 
-This is a starting point for Go solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+This is my take on CodeCrafters' ["Build Your Own Redis" Challenge](https://app.codecrafters.io/r/glorious-mallard-480161). Currently 18 / 97 stages complete, done with "basic" and "lists" stages.
 
-In this challenge, you'll build a toy Redis clone that's capable of handling
-basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about
-event loops, the Redis protocol and more.
+> In this challenge, you'll build a toy Redis clone that's capable of handling basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about event loops, the Redis protocol and more.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## Functionalities
 
-# Passing the first stage
+- Commands: `PING`, `ECHO`, `SET`, `GET`, `LRANGE`, `LLEN`, `RPUSH`, `LPUSH`, `LPOP`, `BLPOP`;
+- Accepts multiple concurrent connections;
+- `SET` supports expiry;
+- Parses and writes Redis protocol directly;
+- `BLPOP` supports timeout;
 
-The entry point for your Redis implementation is in `app/main.go`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+### TODO
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
+- Streams;
+- `TYPE` command;
+- Transactions: `MULTI`, `EXEC`, `DISCARD` and `INCR` commands;
+- Replication;
+- RDB persistence;
+- Pub/sub;
+- Sorted sets;
+- Geospatial commands;
+- Authentication;
 
-That's all!
+## Highlights
 
-# Stage 2 & beyond
+- Redis has a single writer thread. So does my implementation (for now, there's a goroutine for each value type (strings / lists));
+- Easily scalable by sharding concurrent hashmaps into buckets with their own locks and writer goroutines. This would bite me in the ass later for multi-key operations, though;
+- Parsing and writing Redis protocol;
+- Go does not have a double-ended-queue standard implementation (although there's a doubly linked list), so I made my own generic infinite growable circular buffer with cool bit hacks;
+- Priority queues and timers to handle expiry efficiently and deterministcally (instead of tombstone accumulation or sampling);
 
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `go (1.25)` installed locally
-1. Run `./your_program.sh` to run your Redis server, which is implemented in
-   `app/main.go`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+**Note**: Head over to [codecrafters.io](https://app.codecrafters.io/r/glorious-mallard-480161) to try the challenge.
