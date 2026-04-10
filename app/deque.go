@@ -23,7 +23,7 @@ func (d *Deque[T]) grow(minCapacity uint64) {
 	oldLen := d.Len()
 	newBuf := make([]T, newCap)
 
-	for i := uint64(0); i < oldLen; i++ {
+	for i := range oldLen {
 		newBuf[i] = d.buf[(d.head+i)&d.mask]
 	}
 
