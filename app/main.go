@@ -67,6 +67,7 @@ var commandsMap = map[string]command{
 	"LPUSH":  lpush,
 	"LLEN":   llen,
 	"LPOP":   lpop,
+	"BLPOP":  blpop,
 }
 var dispatchTable = [...]func(*sharedState, parsed_request, chan []string) string{
 	ping:   pingFunc,

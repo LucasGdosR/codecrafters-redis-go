@@ -7,10 +7,12 @@ import (
 	"time"
 )
 
-const nullBulkString = "$-1\r\n"
-const simpleOK = "+OK\r\n"
-const emptyArray = "*0\r\n"
-const nullArray = "*-1\r\n"
+const (
+	nullBulkString = "$-1\r\n"
+	simpleOK       = "+OK\r\n"
+	emptyArray     = "*0\r\n"
+	nullArray      = "*-1\r\n"
+)
 
 func pingFunc(s *sharedState, _ parsed_request, _ chan []string) string {
 	return toSimpleString("PONG")
